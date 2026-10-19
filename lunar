@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+#
+#
+#   根据当前时间计算月相，让月亮沿一条弧线从左到右划过屏幕。
+#
+# 月相算法：
+#   儒略日  JD    = Unix秒 / 86400 + 2440587.5
+#   月龄    age   = (JD - 参考新月JD) mod 朔望月(29.530588853)
+#   相位    phase = age / 朔望月        ( 0 = 新月, 0.5 = 满月 )
+#
+# 明暗分界线用一个椭圆近似：
+#   在月面圆内取归一化坐标 (dx, dy)，w = sqrt(1 - dy²)
+#   盈月(phase<=0.5): 亮  <=>  dx >=  w·cos(2π·phase)
+#   亏月(phase >0.5): 亮  <=>  dx <= -w·cos(2π·phase)
+#
+set -u
+
+# ---------------------------------------------------------------- 可调参数
+SYNODIC="29.530588853"     # 朔望月长度（天）
+REF_NEW_MOON="2451550.1"   # 已知新月：2000-01-06 18:14 UTC（儒略日）
+
+STEPS=60                   # 动画帧数
+DELAY=0.03                 # 帧间隔（秒）
+
+MOON_RX=9                  # 月亮横向半径（列）
+MOON_RY=3                # 月亮纵向半径（行）—— 约为 rx 的一半，这样看起来才圆
+
+LIT_CHAR="●"               # 被照亮的部分
+DARK_CHAR="·"              # 阴影部分
+
+# ---------------------------------------------------------------- 终端尺寸
+COLS=$(tput cols  2>/dev/null || echo 80)
+ROWS=$(tput lines 2>/dev/null || echo 24)
+(( COLS < 40 )) && COLS=40
+(( ROWS < 14 )) && ROWS=14
+
+# ---------------------------------------------------------------- 计算月相
+now=$(date -u +%s)
+
+read -r AGE PHASE < <(awk -v now="$now" -v ref="$REF_NEW_MOON" -v syn="$SYNODIC" '
+BEGIN{
+    jd = now/86400 + 2440587.5      # Unix 时间 → 儒略日
+    d  = jd - ref                   # 距参考新月的天数
+    while (d < 0)    d += syn
+    while (d >= syn) d -= syn
+    printf "%.3f %.8f\n", d, d/syn
+}')
+
+read -r ILLUM PNAME < <(awk -v p="$PHASE" 'BEGIN{
+    pi = 3.141592653589793
+    illum = (1 - cos(2*pi*p)) / 2 * 100
+    if      (p < 0.02 || p >= 0.98) nm = "新月"
+    else if (p < 0.23)              nm = "娥眉月"
+    else if (p < 0.27)              nm = "上弦月"
+    else if (p < 0.48)              nm = "盈凸月"
+    else if (p < 0.52)              nm = "满月"
+    else if (p < 0.73)              nm = "亏凸月"
+    else if (p < 0.77)              nm = "下弦月"
+    else                            nm = "残月"
+    printf "%.1f %s\n", illum, nm
+}')
+
+# ---------------------------------------------------------------- 绘制一帧
+# 用法: draw_moon <中心列> <中心行>
+draw_moon() {
+    awk -v COLS="$COLS" -v ROWS="$ROWS" -v cx="$1" -v cy="$2" \
+        -v ph="$PHASE"  -v rx="$MOON_RX" -v ry="$MOON_RY" \
+        -v lit="$LIT_CHAR" -v drk="$DARK_CHAR" '
+    BEGIN{
+        pi2 = 6.283185307179586
+        k   = cos(pi2 * ph)          # 明暗分界线椭圆半轴系数
+
+        for (r = 0; r < ROWS; r++) {
+            line = ""
+            for (c = 0; c < COLS; c++) {
+                dx = (c - cx) / rx
+                dy = (r - cy) / ry
+
+                if (dx*dx + dy*dy <= 1.0) {          # 落在月面圆内
+                    w = sqrt(1.0 - dy*dy)
+                    if (ph <= 0.5) on = (dx >=  w * k)
+                    else           on = (dx <= -w * k)
+                    line = line (on ? lit : drk)
+                } else {
+                    line = line " "
+                }
+            }
+            if (r < ROWS - 1) line = line "\n"
+            printf "%s", line
+        }
+    }'
+}
+
+# ---------------------------------------------------------------- 弧线参数
+CX_MIN=$(( MOON_RX + 1 ))              # 最左位置
+CX_MAX=$(( COLS - MOON_RX - 2 ))       # 最右位置
+CY_TOP=6                               # 弧线最高处的中心行
+CY_BOT=$(( ROWS - 7 ))                 # 弧线最低处的中心行
+(( CY_BOT <= CY_TOP + 1 )) && CY_BOT=$(( CY_TOP + 1 ))
+
+# ---------------------------------------------------------------- 播放动画
+printf '\033[?1049h\033[2J\033[H\033[?25l'   # 进入备用屏 + 清屏 + 隐藏光标
+trap 'printf "\033[?25h\033[?1049l"; exit 0' INT TERM
+trap 'printf "\033[?25h\n"; exit 0' INT TERM
+
+for (( i = 0; i < STEPS; i++ )); do
+    read -r cx cy < <(awk -v i="$i" -v n="$STEPS" \
+                          -v x0="$CX_MIN" -v x1="$CX_MAX" \
+                          -v yb="$CY_BOT" -v yt="$CY_TOP" 'BEGIN{
+        pi = 3.141592653589793
+        t  = (n > 1) ? i/(n-1) : 1
+        # x 线性推进；y 走一段正弦弧（先升后降）
+        printf "%.2f %.2f\n", x0 + t*(x1-x0), yb + (yt-yb)*sin(pi*t)
+    }')
+
+    printf '\033[H'                    # 光标归位，覆盖重绘
+    draw_moon "$cx" "$cy"
+    sleep "$DELAY"
+done
+
+printf '\033[?25h\033[?1049l'          # 恢复光标 + 退出备用屏（月亮随之消失）
+
+printf '  %s   月龄 %.1f 天   %s   照亮 %.1f%%\n' \
+       "$(date '+%Y-%m-%d %H:%M')" "$AGE" "$PNAME" "$ILLUM"
